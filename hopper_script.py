@@ -3,12 +3,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 import mujoco
 import gymnasium as gym
+import pandas as pd
 
 import random
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-import tqdm
+from tqdm import tqdm
 import math
 import os
 import copy
@@ -16,12 +17,6 @@ import copy
 
 # for copying deep nets to another variable
 from copy import deepcopy
-
-# library for ou noise as implemented with the paper
-from ou_noise import ou
-
-# to view model summary
-from torchsummary import summary
 
 # queue for replay buffer
 from collections import deque
@@ -55,24 +50,45 @@ class ReplayBuffer:
         next_obs = torch.stack(next_obs).to(device)
         dones = torch.stack(dones).to(device)
 
-        # # convert list to tensor for easy slciing
-        # batch = torch.tensor(batch)
-
-        # # slicing to grab elements
-        # obs = batch[:,0]
-        # actions =  batch[:,1]
-        # rewards = batch[:,2]
-        # next_obs = batch[:,3]
-        # dones = batch[:,4]
+        # print("state shape",obs.shape)
+        # print("act shape",actions.shape)
+        # print("rewards shape",rewards.shape)
+        # print("next_obs shape",next_obs.shape)
+        # print("done", dones.shape)
 
         # tuple of tensors
         batch = (obs, actions, rewards, next_obs, dones)
 
         return batch
     
+    # def prepopulate(self, env, actor):
+    #     # select action from actor
+    #     # execute action in the env
+    #     # store transition
+
+    #     # intialize state
+    #     state,_ = env.reset()
+
+    #     # loop through num_steps
+    #     for i in range(self.buffer_size):
+    #         # choose random action from environment action space (random policy)
+    #         action = env.action_space.sample()
+    #         # take action: get next state, reward, done
+    #         next_state, reward, done, truncate,_ = env.step(action)
+    #         # add transition to memory
+    #         self.insert(state, action, reward, next_state, done)
+
+    #         # update state
+    #         if done or truncate:
+    #             # if truncation reached, reset state
+    #             state,_ = env.reset()
+    #         else:
+    #             # all else state is the next
+    #             state = next_state
+
 # Actor AKA: The POLICY
 class Actor(nn.Module):
-    def __init__(self, num_states, num_actions, hidden_dims=(400,300), init_weight = 3e3) -> None:
+    def __init__(self, num_states, num_actions, hidden_dims=(400,300), init_weight = 3e-3) -> None:
         super(Actor, self).__init__()
         # In the DDPG paper the parameters for the ACTOR are:
         # - Learning rate: 10^-4
@@ -84,8 +100,6 @@ class Actor(nn.Module):
         # initializing layer weights
         # - hidden layers weights iniitalized with uniform distribution (-1/sqrt(fan_in), 1/sqrt(fan_in)); fan_in being the input of that particular layer
         # - output layer weights initialized with uniform distribution (-3e-3,3e-3)
-
-
         self.init_weight_limit = init_weight
 
         # hidden layers
@@ -122,9 +136,10 @@ class Actor(nn.Module):
         # output layer weights init with uniform distribution (-3e-3,3e-3)
         self.output.weight.data.uniform_(-self.init_weight_limit, self.init_weight_limit)
 
+
 # Critic AKA: The Q-VALUE FUNCTION
 class Critic(nn.Module):
-    def __init__(self, num_states, num_actions, output_dim=1, hidden_dims=(400,300), init_weight = 3e3) -> None:
+    def __init__(self, num_states, num_actions, output_dim=1, hidden_dims=(400,300), init_weight = 3e-3) -> None:
         super(Critic, self).__init__()
         # In the DDPG paper the parameters for the CRITIC are:
         # - Learning rate: 10^-3
@@ -137,7 +152,6 @@ class Critic(nn.Module):
         # initializing layer weights
         # - hidden layers weights iniitalized with uniform distribution (-1/sqrt(fan_in), 1/sqrt(fan_in)); fan_in being the input of that particular layer
         # - output layer weights initialized with uniform distribution (-3e-3,3e-3)
-
         self.init_weight_limit = init_weight
 
         # hidden layers
@@ -147,15 +161,11 @@ class Critic(nn.Module):
         self.output = nn.Linear(hidden_dims[1], output_dim) # hidden to output
         # activation functions
         self.relu = nn.ReLU()
-        self.tanh = nn.Tanh()
 
         # initialize weights
         self.init_weights()
 
-    def forward(self, x):
-        # pull state and action from input
-        state, action = x
-
+    def forward(self, state, action):
         # first hidden layer and relu activation
         x = self.hidden1(state)
         x = self.relu(x)
@@ -165,9 +175,8 @@ class Critic(nn.Module):
         x = self.hidden2(torch.cat([x,action],1))
         x = self.relu(x)
         
-        # feed through output layer w/ tanh activation
-        x = self.output(x)
-        y = self.tanh(x)
+        # feed through output layer
+        y = self.output(x)
 
         return y
     
@@ -202,7 +211,7 @@ class OUNoise:
         dx = self.theta * (self.mu - x) + self.sigma * np.array([random.random() for i in range(len(x))])
         self.state = x + dx
         return torch.tensor(self.state, dtype=torch.float32)
-    
+
 class DDPGAgent:
     def __init__(self, env, params, random_seed) -> None:
         # grabbing parameters
@@ -212,9 +221,13 @@ class DDPGAgent:
         self.critic_lr = params['critic_lr']
         self.batch_size = params['minibatch_size']
         self.buffer_size = params['replay_buffer_size']
+        self.weight_decay = params['L2_weight_decay']
 
-        # setting random seed
-        self.seed = random.seed(random_seed)
+        # setting random seeds
+        random.seed(random_seed)
+        np.random.seed(random_seed)
+        torch.manual_seed(random_seed)
+        torch.cuda.manual_seed(random_seed) # setting for cuda if GPU available
 
         # setting number of states and actions
         self.num_states = env.observation_space.shape[0]
@@ -236,7 +249,7 @@ class DDPGAgent:
         # creating deepcopy to copy the network over to a target
         self.critic_target = deepcopy(self.critic)
         # define optimizer
-        self.critic_optim = Adam(self.critic.parameters(), lr=self.critic_lr)
+        self.critic_optim = Adam(self.critic.parameters(), lr=self.critic_lr, weight_decay=self.weight_decay)
 
         # initialize actor network w target
         self.actor = Actor(self.num_states, self.num_actions).to(self.device)
@@ -254,7 +267,7 @@ class DDPGAgent:
         # self.replay_buffer.prepopulate()
 
     # get action with some noise
-    def get_action(self, state):
+    def get_action(self, env, state):
         # convert to tensor to feed into network
         state = torch.tensor(state, dtype=torch.float32).to(self.device)
 
@@ -263,10 +276,15 @@ class DDPGAgent:
 
         with torch.no_grad():
             action = self.actor(state)
-            action += self.noise.sample()
+            action += self.noise.sample().to(self.device)
         self.actor.train()
         
-        return action.numpy()
+        # copy to cpu if necessary
+        # convert to numpy for OpenAI step input
+        action = action.cpu().numpy()
+        action = np.clip(action,env.action_space.low,env.action_space.high)
+
+        return action
     
     # updates critic and actor
     def update(self):
@@ -274,13 +292,13 @@ class DDPGAgent:
         state_batch, action_batch, reward_batch, next_state_batch, dones_batch = self.replay_buffer.sample_random_minibatch(self.batch_size, self.device)
 
         # calculate target batch
-        with torch.no_grad():
-            target = self.calculate_target(reward_batch, next_state_batch)
+        # with torch.no_grad():
+        target = self.calculate_target(reward_batch, next_state_batch, dones_batch)
 
         # calculate q-value batch
-        q_val_batch = self.critic((state_batch, action_batch))
+        q_val_batch = self.critic(state_batch, action_batch)
 
-        # update critic by minimizing loss
+        # updating critic: by minimizing loss
         loss = nn.MSELoss()
 
         self.critic_optim.zero_grad()
@@ -288,8 +306,8 @@ class DDPGAgent:
         loss_val.backward()        
         self.critic_optim.step()
         
-        # using critic to update actor
-        loss_actor = -self.critic((state_batch, self.actor(state_batch))) # TODO: should this be negative?
+        # updating actor: using critic to update actor
+        loss_actor = -self.critic(state_batch, self.actor(state_batch)) # TODO: should this be negative?
         
         self.actor.zero_grad()
         loss_actor = torch.mean(loss_actor)
@@ -311,28 +329,29 @@ class DDPGAgent:
 
         return loss_actor.item()
 
-    def calculate_target(self, reward, next_state):
+    def calculate_target(self, reward, next_state, dones):
         next_action = self.actor_target(next_state)
-        target = reward + self.gamma*self.critic_target((next_state, next_action))
+        target = reward.view(-1,1) + self.gamma*self.critic_target(next_state, next_action)*(1-dones.view(-1,1))
         return target
     
-# TODO: choose device to run on
 # main loop
-def run_DDPG():
+def run_DDPG(env_type, mode):
     # initialize parameters
     params = {'actor_lr': 0.0001,
             'critic_lr': 0.001,
-            'tau': 0.001,
+            'tau': 0.0001,
             'gamma': 0.99,
             'minibatch_size': 64,
-            'replay_buffer_size': int(10e6),
-            'steps': 100_000}
+            'replay_buffer_size': int(1e6),
+            'steps': 100_000,
+            'L2_weight_decay': 1e-2}
 
     # grab cwd for model saving
     cwd = os.getcwd()
     
     # create environment
-    env = gym.make('Hopper-v5')
+    # env = gym.make(env_type, render_mode=mode)
+    env = gym.make(env_type)
 
     # ddpg object
     ddpg = DDPGAgent(env, params, random_seed=10)
@@ -341,24 +360,30 @@ def run_DDPG():
     scores = []
     scores_deque = deque(maxlen=100)
     loss = []
+    ep_count = 0
+    step_count = 0
 
     # loop through desired number of steps
-    for ep in tqdm.tqdm(range(params['steps']), desc="steps"):
+    while step_count < params['steps']:
         # reset env
         state,_ = env.reset()
 
         # initialize terminal state
         done = False
+        truncate = False
 
         # track cumulative reward
         cumulative_reward = 0
 
         # while environment isnt terminal
-        while not done:
+        while not (done or truncate):
             # grab action with OU noise
-            action = ddpg.get_action(state)
+            action = ddpg.get_action(env, state)
             # execute action in env
             next_state, reward, done, truncate, _ = env.step(action)
+            # increment step
+            step_count += 1
+            
             # store in buffer
             ddpg.replay_buffer.insert(state, action, reward, next_state, done)
 
@@ -373,58 +398,48 @@ def run_DDPG():
             # update cumulative reward
             cumulative_reward += reward
 
+        # add to ep count
+        ep_count += 1
+
         # append to running score and to score deque for average reward approximation
         scores.append(cumulative_reward)
         scores_deque.append(cumulative_reward)
-
+        print(f"Step {step_count}/{params['steps']} | Episode {ep_count} | "
+          f"Average Score: {np.mean(scores_deque):.2f} | "
+          f"Episode Score: {cumulative_reward:.2f}", end="", flush=True)
+        # print('\rEpisode {}\tAverage Score: {:.2f}\tEpisode score: {:.2f}'.format(ep, np.mean(scores_deque), cumulative_reward), end="")
         # save scores
-        if ep % 1000 == 0:
-            torch.save(ddpg.actor.state_dict(), cwd+'/checkpoint_actor.pth')
-            torch.save(ddpg.critic.state_dict(), cwd+'/checkpoint_critic.pth')
-            print('\rEpisode {}\tAverage Score: {:.2f}'.format(ep, np.mean(scores_deque)))   
+        if ep_count % 100 == 0:
+            torch.save(ddpg.actor.state_dict(), f'{cwd}/checkpoint_{env_type}_actor.pth')
+            torch.save(ddpg.critic.state_dict(), f'{cwd}/checkpoint_{env_type}_critic.pth')
+            print('\rStep {} \tEpisode {}\tAverage Score: {:.2f}'.format(step_count, ep_count, np.mean(scores_deque)))   
         
         # reset env if done
         env.reset()
 
+    # save scores and loss
+    scores_df = pd.DataFrame({"Episode": np.arange(1, len(scores) + 1), "Scores": scores})
+    loss_df = pd.DataFrame({"Step": np.arange(1, len(loss) + 1), "Loss": loss})
+
+    scores_df.to_csv(f"{cwd}/results_{env_type}_scores.csv", index=False)
+    loss_df.to_csv(f"{cwd}/results_{env_type}_loss.csv", index=False)
     
     return scores, loss
 
-scores, loss = run_DDPG()
+environments = ['Hopper-v5', 'HalfCheetah-v5', 'BipedalWalker-v3']
 
-plt.plot(np.arange(1,len(scores)+1), scores)
-plt.ylabel('Cumulative reward')
-plt.xlabel('Episodes')
-plt.show()
+render_mode = ['human','human','human','human']
+
+for i, env_type in enumerate(environments):
+    scores, loss = run_DDPG(env_type, render_mode[i])
+
+    plt.plot(np.arange(1,len(scores)+1), scores)
+    plt.title(f"Cumulative reward for {env_type}")
+    plt.ylabel('Cumulative reward')
+    plt.xlabel('Episodes')
+    plot_file = f"{os.getcwd()}/plot_{env_type}_scores.png"
+    plt.savefig(plot_file)
+    # plt.show()
 
 
 
-# grab cwd for model saving
-cwd = os.getcwd()
-
-# instantiate env
-env = gym.make('Hopper-v5', render_mode='human')
-
-# initialize parameters
-params = {'actor_lr': 0.0001,
-        'critic_lr': 0.001,
-        'tau': 0.001,
-        'gamma': 0.99,
-        'minibatch_size': 64,
-        'replay_buffer_size': int(10e6),
-        'steps': 100_000}
-
-ddpg = DDPGAgent(env, params, random_seed=10)
-
-ddpg.actor.load_state_dict(torch.load(cwd+'/checkpoint_actor.pth'))
-ddpg.critic.load_state_dict(torch.load(cwd+'/checkpoint_critic.pth'))
-
-state,_ = env.reset()  
-while True:
-    action = ddpg.get_action(state)
-    env.render()
-    next_state, reward, done, truncate, _ = env.step(action)
-    state = next_state
-    if done:
-        break
-        
-env.close()
